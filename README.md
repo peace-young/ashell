@@ -12,6 +12,15 @@
 
 您可以从 [GitHub Releases 页面](https://github.com/rust-kotlin/ashell/releases/latest) 下载 macOS 和 Windows 版本的最新预编译程序。
 
+## Mac 安装指南
+
+下载并解压后，请先将 `ashell.app` 拖入或移动到 **应用程序 (Applications)** 目录。
+由于应用采用本地签名，初次启动时如果系统提示“App 已损坏，无法打开”，请打开终端（Terminal）并执行以下命令：
+
+```bash
+sudo xattr -cr /Applications/ashell.app
+```
+
 ## 功能特性
 
 当前版本提供了一个功能完备的 GPUI 原生工作区：

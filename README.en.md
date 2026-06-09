@@ -12,6 +12,15 @@ This project focuses on providing a high-performance and visually appealing shel
 
 You can download the latest pre-compiled releases for macOS and Windows from the [GitHub Releases page](https://github.com/rust-kotlin/ashell/releases/latest).
 
+## Mac Installation Guide
+
+After downloading, please unzip the file and move `ashell.app` to your **Applications** folder. 
+Since the app uses ad-hoc signing, macOS may warn that the app is "damaged" upon first launch. If this happens, open Terminal and run the following command:
+
+```bash
+sudo xattr -cr /Applications/ashell.app
+```
+
 ## Features
 
 The current version provides a fully-featured GPUI-native workspace:
