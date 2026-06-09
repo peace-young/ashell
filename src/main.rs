@@ -460,6 +460,26 @@ impl Ashell {
                     }
                     self.status = reason.into();
                 }
+                BackendEvent::TerminalTitleChanged { tab_id, title } => {
+                    if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
+                        if let Some(sftp) = &tab.sftp {
+                            let potential_path = if let Some((_, p)) = title.rsplit_once(':') {
+                                p.trim()
+                            } else {
+                                title.trim()
+                            };
+                            
+                            if potential_path.starts_with('/') || potential_path.starts_with('~') {
+                                let path_to_sync = potential_path.to_string();
+                                if path_to_sync != sftp.current_path {
+                                    if let Some(handle) = self.sftp_handles.get(&tab_id) {
+                                        handle.list_dir(path_to_sync);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -515,7 +535,7 @@ impl Ashell {
         ) {
             Ok(backend) => {
                 let title = if cfg!(windows) { "PowerShell" } else { "Local" }.to_string();
-                let mut tab = TerminalTab::new_local(id.clone(), title, backend);
+                let mut tab = TerminalTab::new_local(id.clone(), title, backend, self.events_tx.clone());
                 tab.resize(DEFAULT_COLS, DEFAULT_ROWS);
                 self.tabs.push(tab);
                 self.active_tab = Some(id);
@@ -1138,7 +1158,7 @@ impl Ashell {
             self.events_tx.clone(),
         );
         self.tabs
-            .push(TerminalTab::new_ssh(id.clone(), &session, backend));
+            .push(TerminalTab::new_ssh(id.clone(), &session, backend, self.events_tx.clone()));
         let sftp_handle = sftp::spawn_sftp(
             self.runtime.handle(),
             id.clone(),

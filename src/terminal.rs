@@ -41,6 +41,7 @@ pub enum BackendEvent {
     RemoteSystem { tab_id: String, snapshot: SystemSnapshot },
     RemoteSystemUnavailable { tab_id: String, reason: String },
     Closed { tab_id: String, reason: String },
+    TerminalTitleChanged { tab_id: String, title: String },
 }
 
 #[derive(Clone)]
@@ -121,17 +122,18 @@ pub struct SftpUiState {
 }
 
 impl TerminalTab {
-    pub fn new_local(id: String, title: String, backend: BackendTx) -> Self {
-        Self::new(id, title, TabKind::Local, "local shell".into(), backend)
+    pub fn new_local(id: String, title: String, backend: BackendTx, events: std::sync::mpsc::Sender<BackendEvent>) -> Self {
+        Self::new(id, title, TabKind::Local, "local shell".into(), backend, events)
     }
 
-    pub fn new_ssh(id: String, session: &Session, backend: BackendTx) -> Self {
+    pub fn new_ssh(id: String, session: &Session, backend: BackendTx, events: std::sync::mpsc::Sender<BackendEvent>) -> Self {
         let mut tab = Self::new(
             id,
             session.name.clone(),
             TabKind::Ssh,
             format!("connecting {}@{}:{}", session.user, session.host, session.port),
             backend,
+            events,
         );
         tab.session = Some(session.clone());
         tab.connected = false;
@@ -145,9 +147,9 @@ impl TerminalTab {
         tab
     }
 
-    fn new(id: String, title: String, kind: TabKind, status: String, backend: BackendTx) -> Self {
+    fn new(id: String, title: String, kind: TabKind, status: String, backend: BackendTx, events: std::sync::mpsc::Sender<BackendEvent>) -> Self {
         Self {
-            id,
+            id: id.clone(),
             title,
             kind,
             status,
@@ -155,7 +157,7 @@ impl TerminalTab {
             session: None,
             sftp: None,
             processor: Processor::new(),
-            term: new_term(100, 30, backend.clone()),
+            term: new_term(100, 30, backend.clone(), id, events),
             cols: 100,
             rows: 30,
             backend,
@@ -324,7 +326,9 @@ fn viewport_selection_from_range(
 
 #[derive(Clone)]
 struct TerminalListener {
+    tab_id: String,
     backend: BackendTx,
+    events: std::sync::mpsc::Sender<BackendEvent>,
 }
 
 impl EventListener for TerminalListener {
@@ -341,19 +345,25 @@ impl EventListener for TerminalListener {
                 self.backend
                     .send(BackendCommand::Input(format(size).into_bytes()));
             }
+            Event::Title(title) => {
+                let _ = self.events.send(BackendEvent::TerminalTitleChanged {
+                    tab_id: self.tab_id.clone(),
+                    title,
+                });
+            }
             _ => {}
         }
     }
 }
 
-fn new_term(cols: u16, rows: u16, backend: BackendTx) -> Term<TerminalListener> {
+fn new_term(cols: u16, rows: u16, backend: BackendTx, tab_id: String, events: std::sync::mpsc::Sender<BackendEvent>) -> Term<TerminalListener> {
     Term::new(
         Config {
             scrolling_history: 2000,
             ..Config::default()
         },
         &TerminalSize::new(cols, rows),
-        TerminalListener { backend },
+        TerminalListener { tab_id, backend, events },
     )
 }
 

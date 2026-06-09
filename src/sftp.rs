@@ -144,7 +144,15 @@ async fn run_sftp(
         match command {
             SftpCommand::Close => break,
             SftpCommand::ListDir(path) => {
-                if let Err(err) = emit_entries(&events, &tab_id, &sftp, &path).await {
+                let actual_path = if path == "~" {
+                    home.clone()
+                } else if let Some(rest) = path.strip_prefix("~/") {
+                    crate::sftp::join_remote(&home, rest)
+                } else {
+                    path
+                };
+
+                if let Err(err) = emit_entries(&events, &tab_id, &sftp, &actual_path).await {
                     let _ = events.send(BackendEvent::SftpStatus {
                         tab_id: tab_id.clone(),
                         text: format!("list failed: {err:#}"),
