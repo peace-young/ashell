@@ -479,6 +479,7 @@ impl Ashell {
                     if self.active_tab.as_deref() == Some(tab_id.as_str()) {
                         self.system_status = Some(reason.clone().into());
                     }
+                    let is_graceful_exit = reason == "Terminal process exited" || reason == "SSH session exited";
                     if let Some(progress) = self.connection_progress.as_mut() {
                         if progress.tab_id == tab_id {
                             progress.lines.push(reason.clone().into());
@@ -486,6 +487,15 @@ impl Ashell {
                             let _ = tab_title;
                             progress.title = t!("connection_failed").into();
                             progress.failed = true;
+                        }
+                    } else if let Some(_) = session_label {
+                        if !is_graceful_exit {
+                            self.connection_progress = Some(ConnectionProgress {
+                                tab_id: tab_id.clone(),
+                                title: t!("connection_failed").into(),
+                                lines: vec![reason.clone().into()],
+                                failed: true,
+                            });
                         }
                     }
                     self.status = reason.into();
