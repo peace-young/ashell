@@ -165,6 +165,9 @@ struct Ashell {
     body_panels: Entity<ResizableState>,
     terminal_scrollbar: TerminalScrollbarHandle,
     remote_files_scroll_handle: UniformListScrollHandle,
+    tabs_scroll_handle: gpui::ScrollHandle,
+    selector_scroll_handle: gpui::ScrollHandle,
+    saved_scroll_handle: gpui::ScrollHandle,
     connection_progress: Option<ConnectionProgress>,
     pending_sftp_path_sync: Option<String>,
     sftp_context_menu: Option<SftpContextMenuState>,
@@ -321,6 +324,9 @@ impl Ashell {
             body_panels,
             terminal_scrollbar: TerminalScrollbarHandle::default(),
             remote_files_scroll_handle: UniformListScrollHandle::new(),
+            tabs_scroll_handle: gpui::ScrollHandle::new(),
+            selector_scroll_handle: gpui::ScrollHandle::new(),
+            saved_scroll_handle: gpui::ScrollHandle::new(),
             connection_progress: None,
             pending_sftp_path_sync: Some("/".into()),
             sftp_context_menu: None,
@@ -633,6 +639,7 @@ impl Ashell {
                 tab.resize(DEFAULT_COLS, DEFAULT_ROWS);
                 self.tabs.push(tab);
                 self.active_tab = Some(id);
+                self.tabs_scroll_handle.scroll_to_item(self.tabs.len() - 1);
                 self.status = "local terminal opened".into();
             }
             Err(err) => {
@@ -964,6 +971,7 @@ impl Ashell {
                     let selector_focus_handle = selector_focus_handle.clone();
                     move |content, window, _cx| {
                         let selected_index = view.read(_cx).selector_selection;
+                        let scroll_handle = view.read(_cx).selector_scroll_handle.clone();
                         content.child(
                             v_flex()
                                 .track_focus(&selector_focus_handle)
@@ -1059,19 +1067,26 @@ impl Ashell {
                                         ),
                                 )
                                 .child(
-                                    v_flex()
+                                    div()
+                                        .relative()
                                         .max_h(px(320.))
-                                        .overflow_scrollbar()
-                                        .gap_2()
-                                        .children(sessions.clone().into_iter().enumerate().map(
-                                            |(ix, session)| {
-                                                let connect_id = session.id.clone();
-                                                let is_selected = selected_index == ix + 2;
-                                                let name = session.name.clone();
-                                                let detail = format!(
-                                                    "{}@{}:{}",
-                                                    session.user, session.host, session.port
-                                                );
+                                        .size_full()
+                                        .child(
+                                            v_flex()
+                                                .size_full()
+                                                .id("selector-scroll-view")
+                                                .track_scroll(&scroll_handle)
+                                                .overflow_y_scroll()
+                                                .gap_2()
+                                                .children(sessions.clone().into_iter().enumerate().map(
+                                                    |(ix, session)| {
+                                                        let connect_id = session.id.clone();
+                                                        let is_selected = selected_index == ix + 2;
+                                                        let name = session.name.clone();
+                                                        let detail = format!(
+                                                            "{}@{}:{}",
+                                                            session.user, session.host, session.port
+                                                        );
                                                 div()
                                                     .id(("selector-open", ix))
                                                     .w_full()
@@ -1126,7 +1141,22 @@ impl Ashell {
                                                     )
                                             },
                                         )),
-                                ),
+                                )
+                                .child(
+                                    div()
+                                        .absolute()
+                                        .top_0()
+                                        .bottom_0()
+                                        .left_0()
+                                        .right_0()
+                                        .child(
+                                            gpui_component::scroll::Scrollbar::new(&scroll_handle)
+                                                .id("selector-scrollbar")
+                                                .axis(gpui_component::scroll::ScrollbarAxis::Vertical)
+                                                .scrollbar_show(gpui_component::scroll::ScrollbarShow::Always)
+                                        )
+                                )
+                            )
                         )
                     }
                 })
@@ -1812,6 +1842,9 @@ impl Ashell {
         let next = (current + delta).clamp(0, entries.len() as i32 - 1) as usize;
         if next != self.selector_selection {
             self.selector_selection = next;
+            if next >= 2 {
+                self.selector_scroll_handle.scroll_to_item(next - 2);
+            }
             cx.notify();
         }
     }
@@ -1881,6 +1914,14 @@ impl Ashell {
             backend,
             self.events_tx.clone(),
         ));
+        self.active_tab = Some(id.clone());
+        self.tabs_scroll_handle.scroll_to_item(self.tabs.len() - 1);
+        if let Some(session_id) = self.active_session_id() {
+            if let Some(index) = self.config.sessions().iter().position(|s| s.id == session_id) {
+                self.saved_scroll_handle.scroll_to_item(index);
+            }
+        }
+        cx.notify();
         let sftp_handle = sftp::spawn_sftp(
             self.runtime.handle(),
             id.clone(),
@@ -1958,7 +1999,17 @@ impl Ashell {
         {
             self.pending_sftp_path_sync = Some(path);
         }
-        self.active_tab = Some(id);
+        self.active_tab = Some(id.clone());
+        if let Some(index) = self.tabs.iter().position(|t| t.id == id) {
+            self.tabs_scroll_handle.scroll_to_item(index);
+        }
+        if self.tabs.iter().any(|t| t.id == id) {
+            if let Some(session_id) = self.active_session_id() {
+                if let Some(index) = self.config.sessions().iter().position(|s| s.id == session_id) {
+                    self.saved_scroll_handle.scroll_to_item(index);
+                }
+            }
+        }
         self.remote_sample_in_flight = false;
         self.request_active_system_snapshot();
         self.focus_handle.focus(window, cx);
@@ -3597,7 +3648,7 @@ impl Ashell {
             .border_r_1()
             .border_color(cx.theme().sidebar_border)
             .bg(cx.theme().sidebar)
-            .overflow_y_scrollbar()
+            .overflow_hidden()
             .child(
                 h_flex()
                     .items_center()
@@ -3721,6 +3772,8 @@ impl Ashell {
             )
             .child(
                 v_flex()
+                    .flex_1()
+                    .min_h(px(0.))
                     .gap_2()
                     .child(
                         div()
@@ -3730,91 +3783,114 @@ impl Ashell {
                             .child(t!("saved")),
                     )
                     .child(
-                        v_flex()
-                            .max_h(px(220.))
-                            .overflow_scrollbar()
-                            .gap_2()
-                            .children(sessions.into_iter().enumerate().map(|(ix, session)| {
-                                let connect_id = session.id.clone();
-                                let edit_id = session.id.clone();
-                                let delete_id = session.id.clone();
-                                let is_active =
-                                    active_session_id.as_deref() == Some(session.id.as_str());
-                                let name = session.name.clone();
-                                let detail = self.session_detail(&session);
-                                div()
-                                    .id(("saved-connect", ix))
-                                    .w_full()
-                                    .p_2()
-                                    .rounded_md()
-                                    .border_1()
-                                    .border_color(if is_active {
-                                        cx.theme().primary
-                                    } else {
-                                        cx.theme().border
-                                    })
-                                    .bg(if is_active {
-                                        cx.theme().tab_active
-                                    } else {
-                                        cx.theme().muted
-                                    })
-                                    .cursor_pointer()
-                                    .hover(|this| this.bg(cx.theme().secondary))
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(move |this, _, _, cx| {
-                                            this.connect_saved_session(connect_id.clone(), cx)
-                                        }),
-                                    )
-                                    .context_menu({
-                                        let view = cx.entity();
-                                        move |menu, window, _| {
-                                            let edit_value = edit_id.clone();
-                                            let delete_value = delete_id.clone();
-                                            menu.item(PopupMenuItem::new("Edit").on_click(
-                                                window.listener_for(
-                                                    &view,
-                                                    move |this, _, window, cx| {
-                                                        this.edit_saved_session(
-                                                            edit_value.clone(),
-                                                            window,
-                                                            cx,
-                                                        )
-                                                    },
-                                                ),
-                                            ))
-                                            .item(
-                                                PopupMenuItem::new("Delete").on_click(
-                                                    window.listener_for(
-                                                        &view,
-                                                        move |this, _, _, cx| {
-                                                            this.remove_saved_session(
-                                                                delete_value.clone(),
-                                                                cx,
-                                                            )
-                                                        },
+                        div()
+                            .relative()
+                            .flex_1()
+                            .min_h(px(0.))
+                            .size_full()
+                            .child(
+                                v_flex()
+                                    .size_full()
+                                    .id("saved-sessions-scroll")
+                                    .track_scroll(&self.saved_scroll_handle)
+                                    .overflow_y_scroll()
+                                    .gap_2()
+                                    .children(sessions.into_iter().enumerate().map(|(ix, session)| {
+                                        let connect_id = session.id.clone();
+                                        let edit_id = session.id.clone();
+                                        let delete_id = session.id.clone();
+                                        let is_active =
+                                            active_session_id.as_deref() == Some(session.id.as_str());
+                                        let name = session.name.clone();
+                                        let detail = self.session_detail(&session);
+                                        div()
+                                            .id(("saved-connect", ix))
+                                            .w_full()
+                                            .p_2()
+                                            .rounded_md()
+                                            .border_1()
+                                            .border_color(if is_active {
+                                                cx.theme().primary
+                                            } else {
+                                                cx.theme().border
+                                            })
+                                            .bg(if is_active {
+                                                cx.theme().tab_active
+                                            } else {
+                                                cx.theme().muted
+                                            })
+                                            .cursor_pointer()
+                                            .hover(|this| this.bg(cx.theme().secondary))
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                cx.listener(move |this, _, _, cx| {
+                                                    this.connect_saved_session(connect_id.clone(), cx)
+                                                }),
+                                            )
+                                            .context_menu({
+                                                let view = cx.entity();
+                                                move |menu, window, _| {
+                                                    let edit_value = edit_id.clone();
+                                                    let delete_value = delete_id.clone();
+                                                    menu.item(PopupMenuItem::new("Edit").on_click(
+                                                        window.listener_for(
+                                                            &view,
+                                                            move |this, _, window, cx| {
+                                                                this.edit_saved_session(
+                                                                    edit_value.clone(),
+                                                                    window,
+                                                                    cx,
+                                                                )
+                                                            },
+                                                        ),
+                                                    ))
+                                                    .item(
+                                                        PopupMenuItem::new("Delete").on_click(
+                                                            window.listener_for(
+                                                                &view,
+                                                                move |this, _, _, cx| {
+                                                                    this.remove_saved_session(
+                                                                        delete_value.clone(),
+                                                                        cx,
+                                                                    )
+                                                                },
+                                                            ),
+                                                        ),
+                                                    )
+                                                }
+                                            })
+                                            .child(
+                                                v_flex()
+                                                    .gap_1()
+                                                    .child(
+                                                        div()
+                                                            .text_size(rems(1.0))
+                                                            .font_weight(FontWeight::SEMIBOLD)
+                                                            .child(name),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .text_size(rems(0.917))
+                                                            .text_color(cx.theme().muted_foreground)
+                                                            .child(detail),
                                                     ),
-                                                ),
                                             )
-                                        }
-                                    })
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .absolute()
+                                    .top_0()
+                                    .bottom_0()
+                                    .left_0()
+                                    .right_0()
                                     .child(
-                                        v_flex()
-                                            .gap_1()
-                                            .child(
-                                                div()
-                                                    .text_size(rems(1.0))
-                                                    .font_weight(FontWeight::SEMIBOLD)
-                                                    .child(name),
-                                            )
-                                            .child(
-                                                div()
-                                                    .text_size(rems(0.917))
-                                                    .text_color(cx.theme().muted_foreground)
-                                                    .child(detail),
-                                            ),
+                                        gpui_component::scroll::Scrollbar::new(&self.saved_scroll_handle)
+                                            .id("saved-scrollbar")
+                                            .axis(gpui_component::scroll::ScrollbarAxis::Vertical)
+                                            .scrollbar_show(gpui_component::scroll::ScrollbarShow::Always)
                                     )
-                            })),
+                            )
                     ),
             )
     }
@@ -3887,15 +3963,13 @@ impl Render for Ashell {
                                 .overflow_hidden()
                                 .child(
                                     v_flex()
-                                        .h(px(60.))
+                                        .h(px(40.))
                                         .w_full()
                                         .flex_none()
-                                        .border_b_1()
-                                        .border_color(cx.theme().border)
                                         .bg(cx.theme().tab_bar)
                                         .child(
                                             h_flex()
-                                                .h(px(48.))
+                                                .h_full()
                                                 .w_full()
                                                 .items_center()
                                                 .gap_2()
@@ -3905,9 +3979,10 @@ impl Render for Ashell {
                                                         .flex_1()
                                                         .min_w(px(0.))
                                                         .h_full()
-                                                        .overflow_x_scrollbar()
+                                                        .overflow_x_hidden()
                                                         .child(
                                                             TabBar::new("ashell-tab-bar")
+                                                                .track_scroll(&self.tabs_scroll_handle)
                                                                 .selected_index(active_tab_index.unwrap_or(0))
                                                                 .children(self.tabs.iter().enumerate().map(|(ix, tab)| {
                                                                     let id = tab.id.clone();
