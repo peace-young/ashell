@@ -151,10 +151,20 @@ jobs:
           name: ${{ matrix.name }}
           path: ${{ env.ASSET }}
 
+  publish:
+    name: Publish Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all workflow artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
       - name: Attach to GitHub Release
-        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: ${{ env.ASSET }}
+          files: dist/**/*
           generate_release_notes: true
           fail_on_unmatched_files: true
