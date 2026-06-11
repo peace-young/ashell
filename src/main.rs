@@ -1660,6 +1660,11 @@ impl Ashell {
             return;
         }
         self.mark_sftp_entry_selected(&entry.full_path, cx);
+        if let Some(sftp) = self.active_sftp_mut() {
+            if !sftp.selected_entries.remove(&entry.full_path) {
+                sftp.selected_entries.insert(entry.full_path);
+            }
+        }
     }
 
     fn mark_sftp_entry_selected(&mut self, path: &str, cx: &mut Context<Self>) {
@@ -3596,7 +3601,7 @@ impl Render for Ashell {
                                         .child(
                                             resizable_panel()
                                                 .size(px(248.))
-                                                .size_range(px(180.)..px(420.))
+                                                .size_range(px(180.)..px(1000.))
                                                 .child(self.render_sftp_panel(window, cx)),
                                         ),
                                 ),
