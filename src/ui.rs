@@ -692,7 +692,7 @@ impl Ashell {
                             .text_size(rems(0.833))
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(cpu_color)
-                            .child("CPU"),
+                            .child(t!("cpu").to_string()),
                     )
                     .child(div().flex_1())
                     .child(
@@ -756,7 +756,7 @@ impl Ashell {
                             .text_size(rems(0.833))
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(mem_color)
-                            .child("MEM"),
+                            .child(t!("mem").to_string()),
                     )
                     .child(div().flex_1())
                     .child(
@@ -826,7 +826,7 @@ impl Ashell {
                                     .text_size(rems(0.833))
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .text_color(net_color)
-                                    .child("NET"),
+                                    .child(t!("net").to_string()),
                             )
                             .child(div().flex_1())
                             .child(
@@ -933,7 +933,7 @@ impl Ashell {
                                     .text_size(rems(0.833))
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .text_color(disk_color)
-                                    .child("DISK"),
+                                    .child(t!("disk").to_string()),
                             )
                             .child(div().flex_1())
                             .child(
@@ -1030,6 +1030,107 @@ impl Ashell {
         panel
     }
 
+    fn render_sidebar_monitoring_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let cpu_pct = self.system.cpu_percent;
+        let mem_pct = self.system.mem_percent;
+        let swap_pct = self.system.swap_percent;
+        let disk_pct = if let Some(root_disk) = self.system.disks.iter().find(|d| d.mount == "/") {
+            if root_disk.total_bytes > 0 {
+                (root_disk.total_bytes - root_disk.available_bytes) as f64 / root_disk.total_bytes as f64
+            } else {
+                0.0
+            }
+        } else {
+            0.0
+        } as f32;
+
+        let cpu_color = cx.theme().chart_1;
+        let mem_color = cx.theme().chart_2;
+        let swap_color = cx.theme().chart_3;
+        let disk_color = cx.theme().chart_5;
+        let net_color = cx.theme().chart_4;
+        let muted_fg = cx.theme().muted_foreground;
+
+        v_flex()
+            .gap_4()
+            .w_full()
+            .p_2()
+            .child(
+                v_flex()
+                    .gap_1()
+                    .child(
+                        h_flex()
+                            .justify_between()
+                            .child(div().text_size(rems(0.85)).text_color(cpu_color).child(t!("cpu").to_string()))
+                            .child(div().text_size(rems(0.85)).text_color(muted_fg).child(format!("{:.1}%", cpu_pct * 100.0))),
+                    )
+                    .child(Progress::new("sidebar-cpu").value(cpu_pct * 100.0).color(cpu_color).with_size(px(4.)).w_full())
+            )
+            .child(
+                v_flex()
+                    .gap_1()
+                    .child(
+                        h_flex()
+                            .justify_between()
+                            .child(div().text_size(rems(0.85)).text_color(mem_color).child(t!("mem").to_string()))
+                            .child(div().text_size(rems(0.85)).text_color(muted_fg).child(self.system.mem_detail.clone())),
+                    )
+                    .child(Progress::new("sidebar-mem").value(mem_pct * 100.0).color(mem_color).with_size(px(4.)).w_full())
+            )
+            .child(
+                v_flex()
+                    .gap_1()
+                    .child(
+                        h_flex()
+                            .justify_between()
+                            .child(div().text_size(rems(0.85)).text_color(swap_color).child(t!("swap").to_string()))
+                            .child(div().text_size(rems(0.85)).text_color(muted_fg).child(self.system.swap_detail.clone())),
+                    )
+                    .child(Progress::new("sidebar-swap").value(swap_pct * 100.0).color(swap_color).with_size(px(4.)).w_full())
+            )
+            .child(
+                v_flex()
+                    .gap_1()
+                    .child(
+                        h_flex()
+                            .justify_between()
+                            .child(div().text_size(rems(0.85)).text_color(disk_color).child(t!("disk").to_string()))
+                            .child(div().text_size(rems(0.85)).text_color(muted_fg).child(format!("{:.1}%", disk_pct * 100.0))),
+                    )
+                    .child(Progress::new("sidebar-disk").value(disk_pct * 100.0).color(disk_color).with_size(px(4.)).w_full())
+            )
+            .child(
+                v_flex()
+                    .gap_1()
+                    .child(
+                        h_flex()
+                            .justify_between()
+                            .child(div().text_size(rems(0.85)).text_color(net_color).child(t!("net").to_string()))
+                            .child(div().text_size(rems(0.85)).text_color(muted_fg).child(t!("live"))),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .child(
+                                h_flex()
+                                    .flex_1()
+                                    .min_w(px(0.))
+                                    .gap_1()
+                                    .child(div().flex_none().text_size(rems(0.75)).text_color(net_color).child("↓"))
+                                    .child(div().text_size(rems(0.75)).child(self.system.net_rx.clone()))
+                            )
+                            .child(
+                                h_flex()
+                                    .flex_1()
+                                    .min_w(px(0.))
+                                    .gap_1()
+                                    .child(div().flex_none().text_size(rems(0.75)).text_color(cx.theme().chart_5).child("↑"))
+                                    .child(div().text_size(rems(0.75)).child(self.system.net_tx.clone()))
+                            )
+                    )
+            )
+    }
+
     fn sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let sessions = self.config.sessions().to_vec();
         let active_session_id = self.active_session_id().map(ToOwned::to_owned);
@@ -1101,6 +1202,9 @@ impl Ashell {
                         cx.listener(|this, _, window, cx| this.open_new_ssh_dialog(window, cx)),
                     ),
             )
+            .when(self.config.monitoring_position() == "Sidebar", |this| {
+                this.child(self.render_sidebar_monitoring_panel(cx))
+            })
             .child(
                 v_flex()
                     .flex_1()
@@ -1454,8 +1558,15 @@ impl Render for Ashell {
 
         let monitoring_contents = v_flex()
             .size_full()
-            .child(self.render_monitoring_panel(window.viewport_size().width, cx))
+            .when(self.config.monitoring_position() == "Bottom", |this| {
+                this.child(self.render_monitoring_panel(window.viewport_size().width, cx))
+            })
             .child(self.render_sftp_panel(window, cx));
+
+        let is_monitor_bottom = self.config.monitoring_position() == "Bottom";
+        let minimized_height = if is_monitor_bottom { 114. } else { 34. };
+        let min_panel_height = if is_monitor_bottom { 260. } else { 180. };
+        let default_panel_height = if is_monitor_bottom { 328. } else { 248. };
 
         let body_panel = if self.sftp_panel_minimized {
             v_flex()
@@ -1470,7 +1581,7 @@ impl Render for Ashell {
                 .child(
                     div()
                         .flex_none()
-                        .h(px(114.))
+                        .h(px(minimized_height))
                         .w_full()
                         .border_t_1()
                         .border_color(cx.theme().border)
@@ -1487,8 +1598,8 @@ impl Render for Ashell {
                             .config
                             .body_panels()
                             .and_then(|s| s.get(1).copied())
-                            .unwrap_or(328.)))
-                        .size_range(px(260.)..px(1200.))
+                            .unwrap_or(default_panel_height)))
+                        .size_range(px(min_panel_height)..px(1200.))
                         .child(monitoring_contents)
                 )
                 .into_any_element()

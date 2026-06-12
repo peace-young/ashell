@@ -1152,6 +1152,72 @@ impl Ashell {
                                     h_flex()
                                         .items_center()
                                         .gap_3()
+                                        .child(div().w(px(240.)).child(t!("monitoring_position").to_string()))
+                                        .child(
+                                            Button::new("monitoring-position-dropdown")
+                                                .small()
+                                                .icon(IconName::PanelLeftOpen)
+                                                .label({
+                                                    let pos = view.read(cx).config.monitoring_position().to_string();
+                                                    if pos == "Sidebar" {
+                                                        t!("position_sidebar").to_string()
+                                                    } else if pos == "Hidden" {
+                                                        t!("position_hidden").to_string()
+                                                    } else {
+                                                        t!("position_bottom").to_string()
+                                                    }
+                                                })
+                                                .dropdown_menu_with_anchor(Anchor::BottomRight, {
+                                                    let view = view.clone();
+                                                    move |mut menu, window, cx| {
+                                                        let pos = view.read(cx).config.monitoring_position().to_string();
+                                                        menu = menu
+                                                            .min_w(160.)
+                                                            .item(
+                                                                PopupMenuItem::new(t!("position_bottom").to_string())
+                                                                    .checked(pos == "Bottom")
+                                                                    .on_click(window.listener_for(
+                                                                        &view,
+                                                                        |this, _, _window, cx| {
+                                                                            this.config.set_monitoring_position("Bottom");
+                                                                            let _ = this.config.save();
+                                                                            cx.notify();
+                                                                        },
+                                                                    )),
+                                                            )
+                                                            .item(
+                                                                PopupMenuItem::new(t!("position_sidebar").to_string())
+                                                                    .checked(pos == "Sidebar")
+                                                                    .on_click(window.listener_for(
+                                                                        &view,
+                                                                        |this, _, _window, cx| {
+                                                                            this.config.set_monitoring_position("Sidebar");
+                                                                            let _ = this.config.save();
+                                                                            cx.notify();
+                                                                        },
+                                                                    )),
+                                                            )
+                                                            .item(
+                                                                PopupMenuItem::new(t!("position_hidden").to_string())
+                                                                    .checked(pos == "Hidden")
+                                                                    .on_click(window.listener_for(
+                                                                        &view,
+                                                                        |this, _, _window, cx| {
+                                                                            this.config.set_monitoring_position("Hidden");
+                                                                            let _ = this.config.save();
+                                                                            cx.notify();
+                                                                        },
+                                                                    )),
+                                                            );
+                                                        menu
+                                                    }
+                                                }),
+                                        )
+                                )
+                                .child(
+                                    h_flex()
+                                        .items_center()
+                                        .gap_3()
                                         .child(div().w(px(240.)).child(t!("language").to_string()))
                                         .child(
                                             Button::new("language-dropdown")

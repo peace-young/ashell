@@ -127,6 +127,12 @@ pub struct ConfigFile {
     pub transfers: Vec<crate::terminal::Transfer>,
     #[serde(default)]
     pub show_hidden_files: bool,
+    #[serde(default = "default_monitoring_position")]
+    pub monitoring_position: String,
+}
+
+fn default_monitoring_position() -> String {
+    "Sidebar".to_string()
 }
 
 fn default_locale() -> String {
@@ -228,6 +234,14 @@ impl ConfigStore {
 
     pub fn set_locale(&mut self, locale: &str) {
         self.cache.locale = locale.to_string();
+    }
+
+    pub fn monitoring_position(&self) -> &str {
+        &self.cache.monitoring_position
+    }
+
+    pub fn set_monitoring_position(&mut self, pos: &str) {
+        self.cache.monitoring_position = pos.to_string();
     }
 
     pub fn terminal_font_size(&self) -> f32 {
