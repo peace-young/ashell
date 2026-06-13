@@ -434,9 +434,8 @@ impl Ashell {
                                     .icon(IconName::Pause)
                                     .on_click(window.listener_for(&view, {
                                         let id = t.info.id.clone();
-                                        let tab_id = t.tab_id.clone();
                                         move |this, _, _, _| {
-                                            if let Some(handle) = this.sftp_handles.get(&tab_id) {
+                                            if let Some(handle) = this.dedicated_sftp_handle.as_ref() {
                                                 handle.pause_transfer(id.clone());
                                             }
                                         }
@@ -450,9 +449,8 @@ impl Ashell {
                                     .icon(IconName::Close)
                                     .on_click(window.listener_for(&view, {
                                         let id = t.info.id.clone();
-                                        let tab_id = t.tab_id.clone();
                                         move |this, _, _, _| {
-                                            if let Some(handle) = this.sftp_handles.get(&tab_id) {
+                                            if let Some(handle) = this.dedicated_sftp_handle.as_ref() {
                                                 handle.cancel_transfer(id.clone());
                                             }
                                         }
@@ -470,9 +468,8 @@ impl Ashell {
                                     .icon(IconName::Play)
                                     .on_click(window.listener_for(&view, {
                                         let id = t.info.id.clone();
-                                        let tab_id = t.tab_id.clone();
                                         move |this, _, _, _| {
-                                            if let Some(handle) = this.sftp_handles.get(&tab_id) {
+                                            if let Some(handle) = this.dedicated_sftp_handle.as_ref() {
                                                 handle.resume_transfer(id.clone());
                                             }
                                         }
@@ -486,9 +483,8 @@ impl Ashell {
                                     .icon(IconName::Close)
                                     .on_click(window.listener_for(&view, {
                                         let id = t.info.id.clone();
-                                        let tab_id = t.tab_id.clone();
                                         move |this, _, _, _| {
-                                            if let Some(handle) = this.sftp_handles.get(&tab_id) {
+                                            if let Some(handle) = this.dedicated_sftp_handle.as_ref() {
                                                 handle.cancel_transfer(id.clone());
                                             }
                                         }
@@ -698,19 +694,15 @@ impl Ashell {
                         selected_entries.clone().into_iter().collect();
                     move |_, window, cx| {
                         view.update(cx, |this, cx| {
-                            if let Some(id) = this.active_tab.clone() {
-                                if let Some(handle) = this.sftp_handles.get(&id) {
-                                    let _ = handle.commands.send(
-                                        crate::sftp::SftpCommand::DeletePaths(
-                                            paths_to_delete.clone(),
-                                        ),
-                                    );
-                                }
-                                if let Some(tab) = this.tabs.iter_mut().find(|t| t.id == id) {
-                                    if let Some(sftp) = tab.sftp.as_mut() {
-                                        sftp.selected_entries.clear();
-                                    }
-                                }
+                            if let Some(handle) = this.dedicated_sftp_handle.as_ref() {
+                                let _ = handle.commands.send(
+                                    crate::sftp::SftpCommand::DeletePaths(
+                                        paths_to_delete.clone(),
+                                    ),
+                                );
+                            }
+                            if let Some(sftp) = this.dedicated_sftp_state.as_mut() {
+                                sftp.selected_entries.clear();
                             }
                             cx.notify();
                         });
@@ -827,21 +819,15 @@ impl Ashell {
                                     let view = view.clone();
                                     move |_, window, cx| {
                                         view.update(cx, |this, cx| {
-                                            if let Some(id) = this.active_tab.clone() {
-                                                if let Some(handle) = this.sftp_handles.get(&id) {
-                                                    let _ = handle.commands.send(
-                                                        crate::sftp::SftpCommand::DeletePaths(
-                                                            paths_to_delete.clone(),
-                                                        ),
-                                                    );
-                                                }
-                                                if let Some(tab) =
-                                                    this.tabs.iter_mut().find(|t| t.id == id)
-                                                {
-                                                    if let Some(sftp) = tab.sftp.as_mut() {
-                                                        sftp.selected_entries.clear();
-                                                    }
-                                                }
+                                            if let Some(handle) = this.dedicated_sftp_handle.as_ref() {
+                                                let _ = handle.commands.send(
+                                                    crate::sftp::SftpCommand::DeletePaths(
+                                                        paths_to_delete.clone(),
+                                                    ),
+                                                );
+                                            }
+                                            if let Some(sftp) = this.dedicated_sftp_state.as_mut() {
+                                                sftp.selected_entries.clear();
                                             }
                                             cx.notify();
                                         });

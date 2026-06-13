@@ -25,9 +25,100 @@ use crate::{
     config::{AuthMethod, ConfigStore},
     sftp::SftpHandle,
     system::{SystemSampler, SystemSnapshot},
-    terminal::{self, BackendEvent, TabKind, TerminalTab},
+    terminal::{self, BackendCommand, BackendEvent, TabKind, TerminalTab},
     ssh_terminal,
 };
+
+#[derive(Clone, Debug)]
+pub(crate) enum PaneLayout {
+    Single(String),
+    Horizontal(Vec<PaneLayout>, f32), // children, split_ratio (0.0-1.0)
+    Vertical(Vec<PaneLayout>, f32),   // children, split_ratio (0.0-1.0)
+}
+
+#[derive(Clone)]
+pub(crate) struct TabGroup {
+    pub(crate) id: String,
+    pub(crate) title: String,
+    pub(crate) pane_root: PaneLayout,
+}
+
+impl PaneLayout {
+    pub fn tab_ids(&self) -> Vec<&str> {
+        match self {
+            PaneLayout::Single(id) => vec![id.as_str()],
+            PaneLayout::Horizontal(children, _) | PaneLayout::Vertical(children, _) => {
+                children.iter().flat_map(|c| c.tab_ids()).collect()
+            }
+        }
+    }
+
+    pub fn contains(&self, tab_id: &str) -> bool {
+        match self {
+            PaneLayout::Single(id) => id == tab_id,
+            PaneLayout::Horizontal(children, _) | PaneLayout::Vertical(children, _) => {
+                children.iter().any(|c| c.contains(tab_id))
+            }
+        }
+    }
+
+    pub fn focused_tab_id(&self, path: &[usize]) -> Option<&str> {
+        match self {
+            PaneLayout::Single(id) if path.is_empty() => Some(id.as_str()),
+            PaneLayout::Horizontal(children, _) | PaneLayout::Vertical(children, _) => {
+                let (&first, rest) = path.split_first()?;
+                children.get(first).and_then(|c| c.focused_tab_id(rest))
+            }
+            _ => None,
+        }
+    }
+
+    pub fn replace_at(&mut self, path: &[usize], replacement: PaneLayout) {
+        match (self, path) {
+            (this @ PaneLayout::Single(_), []) => *this = replacement,
+            (PaneLayout::Horizontal(children, _) | PaneLayout::Vertical(children, _), [first, rest @ ..]) => {
+                if let Some(child) = children.get_mut(*first) {
+                    child.replace_at(rest, replacement);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    pub fn remove_tab(&mut self, tab_id: &str) -> bool {
+        match self {
+            PaneLayout::Single(id) if id == tab_id => {
+                *self = PaneLayout::Single(String::new());
+                true
+            }
+            PaneLayout::Single(_) => false,
+            PaneLayout::Horizontal(children, _) | PaneLayout::Vertical(children, _) => {
+                for child in children.iter_mut() {
+                    child.remove_tab(tab_id);
+                }
+                children.retain(|c| !matches!(c, PaneLayout::Single(id) if id.is_empty()));
+                if children.is_empty() {
+                    *self = PaneLayout::Single(String::new());
+                } else if children.len() == 1 {
+                    if let Some(replacement) = children.pop() {
+                        *self = replacement;
+                    }
+                }
+                true
+            }
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn total_panes(&self) -> usize {
+        match self {
+            PaneLayout::Single(_) => 1,
+            PaneLayout::Horizontal(children, _) | PaneLayout::Vertical(children, _) => {
+                children.iter().map(|c| c.total_panes()).sum()
+            }
+        }
+    }
+}
 
 pub(crate) struct TerminalScrollbarState {
     line_height: Pixels,
@@ -114,12 +205,13 @@ pub(crate) struct Ashell {
     pub(crate) ui_font_family: SharedString,
     pub(crate) terminal_font_family: SharedString,
     pub(crate) tabs: Vec<TerminalTab>,
-    pub(crate) sftp_handles: HashMap<String, SftpHandle>,
     pub(crate) active_tab: Option<String>,
+    pub(crate) tab_groups: Vec<TabGroup>,
+    pub(crate) active_group: Option<String>,
     pub(crate) selector_selection: usize,
     pub(crate) workspace_panels: Entity<ResizableState>,
     pub(crate) body_panels: Entity<ResizableState>,
-    pub(crate) terminal_scrollbar: TerminalScrollbarHandle,
+    pub(crate) terminal_scrollbars: HashMap<String, TerminalScrollbarHandle>,
     pub(crate) remote_files_scroll_handle: UniformListScrollHandle,
     pub(crate) disk_scroll_handle: gpui::ScrollHandle,
     pub(crate) tabs_scroll_handle: gpui::ScrollHandle,
@@ -135,8 +227,12 @@ pub(crate) struct Ashell {
     pub(crate) transfers: Vec<crate::terminal::Transfer>,
     pub(crate) show_transfers_dialog: bool,
     pub(crate) system_status: Option<SharedString>,
-    pub(crate) terminal_bounds: Option<Bounds<Pixels>>,
+    pub(crate) pane_root: PaneLayout,
+    pub(crate) focused_pane_path: Vec<usize>,
+    pub(crate) terminal_bounds: HashMap<String, Bounds<Pixels>>,
     pub(crate) terminal_selecting: bool,
+    pub(crate) dragging_splitter: Option<(Vec<usize>, usize)>, // (parent_path, child_index)
+    pub(crate) drag_split_origin: Option<gpui::Point<Pixels>>,
     pub(crate) terminal_marked_text: Option<String>,
     pub(crate) sftp_panel_minimized: bool,
     pub(crate) prev_monitoring_size: Option<Pixels>,
@@ -150,6 +246,9 @@ pub(crate) struct Ashell {
     pub(crate) last_system_sample: Instant,
     pub(crate) last_theme_sync: Instant,
 
+    pub(crate) system_tab_id: Option<String>,
+    pub(crate) dedicated_sftp_handle: Option<SftpHandle>,
+    pub(crate) dedicated_sftp_state: Option<terminal::SftpUiState>,
     pub(crate) remote_sample_in_flight: bool,
     pub(crate) runtime: Runtime,
     pub(crate) events_rx: mpsc::Receiver<BackendEvent>,
@@ -284,12 +383,15 @@ impl Ashell {
             ui_font_family,
             terminal_font_family,
             tabs: Vec::new(),
-            sftp_handles: HashMap::new(),
             active_tab: None,
+            tab_groups: Vec::new(),
+            active_group: None,
+            pane_root: PaneLayout::Single(String::new()),
+            focused_pane_path: Vec::new(),
             selector_selection: 0,
             workspace_panels,
             body_panels,
-            terminal_scrollbar: TerminalScrollbarHandle::default(),
+            terminal_scrollbars: HashMap::new(),
             remote_files_scroll_handle: UniformListScrollHandle::new(),
             disk_scroll_handle: gpui::ScrollHandle::new(),
             tabs_scroll_handle: gpui::ScrollHandle::new(),
@@ -305,9 +407,11 @@ impl Ashell {
             transfers: config.transfers(),
             show_transfers_dialog: false,
             system_status: None,
-            terminal_bounds: None,
+            terminal_bounds: HashMap::new(),
             terminal_selecting: false,
             terminal_marked_text: None,
+            dragging_splitter: None,
+            drag_split_origin: None,
             sftp_panel_minimized: false,
             prev_monitoring_size: None,
             status: "ready".into(),
@@ -320,6 +424,9 @@ impl Ashell {
             last_system_sample: Instant::now(),
             last_theme_sync: Instant::now(),
 
+            system_tab_id: None,
+            dedicated_sftp_handle: None,
+            dedicated_sftp_state: None,
             remote_sample_in_flight: false,
             runtime: Runtime::new().expect("create tokio runtime"),
             events_rx,
@@ -360,10 +467,8 @@ impl Ashell {
                     if !name.is_empty() {
                         let base_path = self.sftp_path_input.read(cx).text().to_string();
                         let path = crate::sftp::join_remote(&base_path, &name);
-                        if let Some(id) = self.active_tab.clone() {
-                            if let Some(handle) = self.sftp_handles.get(&id) {
-                                let _ = handle.commands.send(crate::sftp::SftpCommand::CreateDir(path));
-                            }
+                        if let Some(handle) = self.dedicated_sftp_handle.as_ref() {
+                            let _ = handle.commands.send(crate::sftp::SftpCommand::CreateDir(path));
                         }
                     }
                     self.sftp_creating_folder = false;
@@ -381,16 +486,26 @@ impl Ashell {
 
     pub(crate) fn start_event_pump(&self, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
+            let mut idle_frames = 0u32;
             loop {
                 cx.background_executor()
                     .timer(Duration::from_millis(16))
                     .await;
                 if this
                     .update(cx, |this, cx| {
-                        this.drain_backend_events();
-                        this.sample_system_if_due();
+                        let changed = this.drain_backend_events();
+                        let system_sampled = this.sample_system_if_due();
                         this.sync_theme_if_due(cx);
-                        cx.notify();
+                        if changed || system_sampled {
+                            cx.notify();
+                            idle_frames = 0;
+                        } else {
+                            idle_frames += 1;
+                            if idle_frames >= 60 {
+                                cx.notify();
+                                idle_frames = 0;
+                            }
+                        }
                     })
                     .is_err()
                 {
@@ -401,9 +516,11 @@ impl Ashell {
         .detach();
     }
 
-    pub(crate) fn drain_backend_events(&mut self) {
+    pub(crate) fn drain_backend_events(&mut self) -> bool {
+        let mut changed = false;
         let mut transfers_changed = false;
         while let Ok(event) = self.events_rx.try_recv() {
+            changed = true;
             match event {
                 BackendEvent::Output { tab_id, bytes } => {
                     if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
@@ -424,6 +541,11 @@ impl Ashell {
                 BackendEvent::Connected { tab_id } => {
                     if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
                         tab.connected = true;
+                        if tab.session.is_some() {
+                            if self.system_tab_id.is_none() {
+                                self.system_tab_id = Some(tab_id.clone());
+                            }
+                        }
                     }
                     self.request_active_system_snapshot();
                     if self
@@ -435,39 +557,31 @@ impl Ashell {
                     }
                 }
                 BackendEvent::SftpEntries {
-                    tab_id,
+                    tab_id: _,
                     path,
                     entries,
                 } => {
-                    if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
-                        if let Some(sftp) = tab.sftp.as_mut() {
-                            sftp.current_path = path;
-                            sftp.entries = entries;
-                            if self.active_tab.as_deref() == Some(tab_id.as_str()) {
-                                self.pending_sftp_path_sync = Some(sftp.current_path.clone());
-                            }
-                        }
+                    if let Some(sftp) = self.dedicated_sftp_state.as_mut() {
+                        sftp.current_path = path;
+                        sftp.entries = entries;
+                        self.pending_sftp_path_sync = Some(sftp.current_path.clone());
                     }
                 }
-                BackendEvent::SftpPreview { tab_id, preview } => {
-                    if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
-                        if let Some(sftp) = tab.sftp.as_mut() {
-                            sftp.selected_path = Some(preview.path.clone());
-                            sftp.preview = Some(preview);
-                        }
+                BackendEvent::SftpPreview { tab_id: _, preview } => {
+                    if let Some(sftp) = self.dedicated_sftp_state.as_mut() {
+                        sftp.selected_path = Some(preview.path.clone());
+                        sftp.preview = Some(preview);
                     }
                 }
-                BackendEvent::SftpStatus { tab_id, text } => {
-                    if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
-                        if let Some(sftp) = tab.sftp.as_mut() {
-                            sftp.status = text.clone();
-                        }
+                BackendEvent::SftpStatus { tab_id: _, text } => {
+                    if let Some(sftp) = self.dedicated_sftp_state.as_mut() {
+                        sftp.status = text.clone();
                     }
                     self.status = text.into();
                 }
                 BackendEvent::RemoteSystem { tab_id, snapshot } => {
                     self.remote_sample_in_flight = false;
-                    if self.active_tab.as_deref() == Some(tab_id.as_str()) {
+                    if self.system_tab_id.as_deref() == Some(tab_id.as_str()) {
                         self.system_status = None;
                         self.system = snapshot.clone();
                         self.cpu_history.push(snapshot.cpu_percent);
@@ -486,7 +600,7 @@ impl Ashell {
                 }
                 BackendEvent::RemoteSystemUnavailable { tab_id, reason } => {
                     self.remote_sample_in_flight = false;
-                    if self.active_tab.as_deref() == Some(tab_id.as_str()) {
+                    if self.system_tab_id.as_deref() == Some(tab_id.as_str()) {
                         self.system_status = Some(reason.clone().into());
                         self.status = reason.into();
                     }
@@ -503,11 +617,62 @@ impl Ashell {
                             format!("{}@{}:{}", session.user, session.host, session.port)
                         });
                     }
-                    if self.active_tab.as_deref() == Some(tab_id.as_str()) {
+                    if self.system_tab_id.as_deref() == Some(tab_id.as_str()) {
                         self.system_status = Some(reason.clone().into());
                     }
-                    let is_graceful_exit = reason == "Terminal process exited"
-                        || reason == "SSH session exited";
+                    let is_graceful_exit = reason == "local shell closed"
+                        || reason == "ssh session closed";
+                    // Auto-close the pane on graceful exit (e.g. user typed exit)
+                    if is_graceful_exit {
+                        if let Some(ix) = self.tabs.iter().position(|t| t.id == tab_id) {
+                            self.tabs[ix].backend.send(BackendCommand::Close);
+                            self.tabs.remove(ix);
+                        }
+                        if let Some(g) = self.tab_groups.iter_mut().find(|g| g.pane_root.contains(&tab_id)) {
+                            g.pane_root.remove_tab(&tab_id);
+                        }
+                        self.pane_root.remove_tab(&tab_id);
+                        self.sync_pane_root_to_group();
+                        if self.tabs.is_empty() || self.tab_groups.is_empty() {
+                            self.pane_root = PaneLayout::Single(String::new());
+                            self.focused_pane_path = vec![];
+                            self.active_tab = None;
+                            self.active_group = None;
+                            self.system_tab_id = None;
+                            self.cpu_history.clear();
+                            self.net_rx_history.clear();
+                            self.net_tx_history.clear();
+                            self.system_status = None;
+                            if let Some(handle) = self.dedicated_sftp_handle.take() {
+                                handle.close();
+                            }
+                            self.dedicated_sftp_state = None;
+                            return changed;
+                        }
+                        // Reassign system_tab_id if the closed tab was monitored
+                        if self.system_tab_id.as_deref() == Some(tab_id.as_str()) {
+                            self.system_tab_id = self.tabs.iter().find(|t| t.kind == TabKind::Ssh && t.connected).map(|t| t.id.clone());
+                            self.cpu_history.clear();
+                            self.net_rx_history.clear();
+                            self.net_tx_history.clear();
+                            self.remote_sample_in_flight = false;
+                            self.request_active_system_snapshot();
+                        }
+                        let was_active = self.active_tab.as_deref() == Some(tab_id.as_str());
+                        if was_active
+                            || self.active_tab.as_ref().is_some_and(|active_id| !self.tabs.iter().any(|tab| &tab.id == active_id))
+                        {
+                            let first_id = self.pane_root.tab_ids().first().copied().map(String::from)
+                                .or_else(|| self.tabs.first().map(|t| t.id.clone()));
+                            if let Some(new_id) = first_id {
+                                self.active_tab = Some(new_id.clone());
+                                self.focus_pane_with_id(new_id);
+                            }
+                        }
+                        self.status = reason.into();
+                        self.remote_sample_in_flight = false;
+                        return changed;
+                    }
                     if let Some(progress) = self.connection_progress.as_mut() {
                         if progress.tab_id == tab_id {
                             progress.lines.push(reason.clone().into());
@@ -564,11 +729,9 @@ impl Ashell {
                     );
                     transfers_changed = true;
                 }
-                BackendEvent::SftpHome { tab_id, home } => {
-                    if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
-                        if let Some(sftp) = tab.sftp.as_mut() {
-                            sftp.home_dir = home;
-                        }
+                BackendEvent::SftpHome { tab_id: _, home } => {
+                    if let Some(sftp) = self.dedicated_sftp_state.as_mut() {
+                        sftp.home_dir = home;
                     }
                 }
                 BackendEvent::TerminalTitleChanged { tab_id, title } => {
@@ -581,17 +744,18 @@ impl Ashell {
         if transfers_changed {
             self.config.set_transfers(self.transfers.clone());
         }
+        changed
     }
 
-    pub(crate) fn sample_system_if_due(&mut self) {
+    pub(crate) fn sample_system_if_due(&mut self) -> bool {
         if self.last_system_sample.elapsed() >= SystemSampler::interval() {
             self.last_system_sample = Instant::now();
-            // When an SSH tab is active with remote data flowing, don't push
-            // local machine data into history. Instead trigger a remote fetch
-            // so both the current values and history reflect the remote server.
-            if matches!(self.active_kind(), Some(TabKind::Ssh)) && self.system_status.is_none() {
-                self.request_active_system_snapshot();
-                return;
+            // Use system_tab_id (not active_tab) to decide remote vs local sampling
+            if let Some(ref tab_id) = self.system_tab_id.clone() {
+                if self.tabs.iter().any(|t| t.id == *tab_id && t.kind == TabKind::Ssh && t.connected) && self.system_status.is_none() {
+                    self.request_active_system_snapshot();
+                    return false;
+                }
             }
             let snapshot = self.system_sampler.sample();
             let cpu_usage = snapshot.cpu_percent;
@@ -608,7 +772,9 @@ impl Ashell {
                 self.net_tx_history.remove(0);
             }
             self.system = snapshot;
+            return true;
         }
+        false
     }
 
     pub(crate) fn sync_theme_if_due(&mut self, cx: &mut Context<Self>) {
@@ -620,26 +786,31 @@ impl Ashell {
     }
 
     pub(crate) fn request_active_system_snapshot(&mut self) {
-        if let Some((tab_id, session)) = self.active_ssh_session() {
-            if self.remote_sample_in_flight {
-                return;
-            }
-            self.remote_sample_in_flight = true;
-            let events = self.events_tx.clone();
-            self.runtime.spawn(async move {
-                match ssh_terminal::sample_remote_system(session).await {
-                    Ok(snapshot) => {
-                        let _ = events.send(BackendEvent::RemoteSystem { tab_id, snapshot });
-                    }
-                    Err(err) => {
-                        let _ = events.send(BackendEvent::RemoteSystemUnavailable {
-                            tab_id,
-                            reason: format!("remote metrics unavailable: {err:#}"),
-                        });
-                    }
-                }
-            });
+        let Some(ref tab_id) = self.system_tab_id.clone() else { return };
+        let Some(session) = (|| {
+            let tab = self.tabs.iter().find(|t| t.id == *tab_id)?;
+            if !tab.connected { return None; }
+            tab.session.clone()
+        })() else { return };
+        if self.remote_sample_in_flight {
+            return;
         }
+        self.remote_sample_in_flight = true;
+        let events = self.events_tx.clone();
+        let tab_id = tab_id.clone();
+        self.runtime.spawn(async move {
+            match ssh_terminal::sample_remote_system(session).await {
+                Ok(snapshot) => {
+                    let _ = events.send(BackendEvent::RemoteSystem { tab_id, snapshot });
+                }
+                Err(err) => {
+                    let _ = events.send(BackendEvent::RemoteSystemUnavailable {
+                        tab_id,
+                        reason: format!("remote metrics unavailable: {err:#}"),
+                    });
+                }
+            }
+        });
     }
 
     pub(crate) fn terminal_ime_bounds_for_range(

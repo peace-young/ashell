@@ -1,6 +1,6 @@
 use gpui::{
     App, AppContext as _, Context, Entity, KeyDownEvent, MouseButton,
-    MouseDownEvent, SharedString, Window, px,
+    MouseDownEvent, MouseMoveEvent, SharedString, Window, px,
 };
 use gpui_component::{
     Theme, WindowExt as _,
@@ -10,7 +10,7 @@ use rust_i18n::t;
 use uuid::Uuid;
 
 use crate::{
-    Ashell, ConnectionProgress, SelectorEntry,
+    Ashell, ConnectionProgress, PaneLayout, SelectorEntry, TabGroup,
     config::{AuthMethod, Session},
     local_terminal,
     sftp,
@@ -35,7 +35,16 @@ impl Ashell {
                     TerminalTab::new_local(id.clone(), title, backend, self.events_tx.clone());
                 tab.resize(DEFAULT_COLS, DEFAULT_ROWS);
                 self.tabs.push(tab);
-                self.active_tab = Some(id);
+                self.active_tab = Some(id.clone());
+                self.pane_root = PaneLayout::Single(id.clone());
+                self.focused_pane_path = vec![];
+                let group_id = Uuid::new_v4().to_string();
+                self.tab_groups.push(TabGroup {
+                    id: group_id.clone(),
+                    title: "Local".to_string(),
+                    pane_root: PaneLayout::Single(id),
+                });
+                self.active_group = Some(group_id);
                 self.tabs_scroll_handle.scroll_to_item(self.tabs.len() - 1);
                 self.status = "local terminal opened".into();
             }
@@ -352,6 +361,15 @@ impl Ashell {
             self.events_tx.clone(),
         ));
         self.active_tab = Some(id.clone());
+        self.pane_root = PaneLayout::Single(id.clone());
+        self.focused_pane_path = vec![];
+        let group_id = Uuid::new_v4().to_string();
+        self.tab_groups.push(TabGroup {
+            id: group_id.clone(),
+            title: session.name.clone(),
+            pane_root: PaneLayout::Single(id.clone()),
+        });
+        self.active_group = Some(group_id);
         self.tabs_scroll_handle.scroll_to_item(self.tabs.len() - 1);
         if let Some(session_id) = self.active_session_id() {
             if let Some(index) = self.config.sessions().iter().position(|s| s.id == session_id) {
@@ -359,13 +377,17 @@ impl Ashell {
             }
         }
         cx.notify();
-        let sftp_handle = sftp::spawn_sftp(
+        let dedicated_sftp = sftp::spawn_sftp(
             self.runtime.handle(),
             id.clone(),
             session,
             self.events_tx.clone(),
         );
-        self.sftp_handles.insert(id.clone(), sftp_handle);
+        self.dedicated_sftp_handle = Some(dedicated_sftp);
+        self.dedicated_sftp_state = Some(crate::terminal::SftpUiState {
+            status: t!("sftp_connecting").to_string(),
+            ..Default::default()
+        });
         self.active_tab = Some(id.clone());
         self.pending_sftp_path_sync = Some("/".into());
         self.connection_progress = Some(ConnectionProgress {
@@ -403,9 +425,6 @@ impl Ashell {
         };
 
         self.tabs[ix].backend.send(BackendCommand::Close);
-        if let Some(handle) = self.sftp_handles.remove(&progress.tab_id) {
-            handle.close();
-        }
         self.tabs.remove(ix);
         if self.active_tab.as_deref() == Some(progress.tab_id.as_str()) {
             self.active_tab = self
@@ -426,20 +445,26 @@ impl Ashell {
         self.close_tab(progress.tab_id, cx);
     }
 
+    #[allow(dead_code)]
     pub(crate) fn activate_tab(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(path) = self
-            .tabs
-            .iter()
-            .find(|tab| tab.id == id)
-            .and_then(|tab| tab.sftp.as_ref())
-            .map(|sftp| sftp.current_path.clone())
-        {
-            self.pending_sftp_path_sync = Some(path);
+        // Save current group state
+        if let Some(group_id) = self.active_group.clone() {
+            if let Some(group) = self.tab_groups.iter_mut().find(|g| g.id == group_id) {
+                group.pane_root = self.pane_root.clone();
+            }
         }
         self.active_tab = Some(id.clone());
-        self.cpu_history.clear();
-        self.net_rx_history.clear();
-        self.net_tx_history.clear();
+        // Find which group this tab belongs to and restore its pane_root
+        let tab_group = self.tab_groups.iter_mut().find(|g| g.pane_root.contains(&id));
+        if let Some(group) = tab_group {
+            self.pane_root = group.pane_root.clone();
+            self.active_group = Some(group.id.clone());
+            // Focus the activated tab in the pane tree
+            self.focus_pane_with_id(id.clone());
+        } else {
+            self.pane_root = PaneLayout::Single(id.clone());
+            self.focused_pane_path = vec![];
+        }
         if let Some(index) = self.tabs.iter().position(|t| t.id == id) {
             self.tabs_scroll_handle.scroll_to_item(index);
         }
@@ -450,39 +475,100 @@ impl Ashell {
                 }
             }
         }
-        self.remote_sample_in_flight = false;
-        self.request_active_system_snapshot();
         self.focus_handle.focus(window, cx);
         cx.notify();
     }
 
     pub(crate) fn close_tab(&mut self, id: String, cx: &mut Context<Self>) {
-        if let Some(ix) = self.tabs.iter().position(|tab| tab.id == id) {
-            let was_active = self.active_tab.as_deref() == Some(id.as_str());
-            self.tabs[ix].backend.send(BackendCommand::Close);
-            if let Some(handle) = self.sftp_handles.remove(&id) {
-                handle.close();
-            }
-            self.tabs.remove(ix);
-            if was_active
-                || self
-                    .active_tab
-                    .as_ref()
-                    .is_some_and(|active_id| !self.tabs.iter().any(|tab| &tab.id == active_id))
-            {
-                self.active_tab = self
-                    .tabs
-                    .get(ix)
-                    .or_else(|| self.tabs.get(ix.saturating_sub(1)))
-                    .map(|tab| tab.id.clone());
-                self.cpu_history.clear();
-                self.net_rx_history.clear();
-                self.net_tx_history.clear();
-                self.remote_sample_in_flight = false;
-                self.request_active_system_snapshot();
+        let group_ix = self.tab_groups.iter().position(|g| g.pane_root.contains(&id));
+        let Some(ref group) = group_ix.map(|i| self.tab_groups[i].clone()) else {
+            // Fallback: find and close individual tab
+            eprintln!("[close_tab] no group found for tab '{}', closing individually", id);
+            if let Some(ix) = self.tabs.iter().position(|tab| tab.id == id) {
+                self.tabs[ix].backend.send(BackendCommand::Close);
+                self.tabs.remove(ix);
             }
             cx.notify();
+            return;
+        };
+
+        let pane_ids = group.pane_root.tab_ids();
+        let pane_ids_str: Vec<&str> = pane_ids.iter().map(|s| *s).collect();
+        let is_group_close = pane_ids.len() <= 1;
+        eprintln!(
+            "[close_tab] id='{}' group_panes={:?} is_group_close={}",
+            id, pane_ids_str, is_group_close
+        );
+        if is_group_close {
+            // Close all tabs in the group
+            let tab_ids: Vec<String> = group.pane_root.tab_ids().iter().map(|s| s.to_string()).collect();
+            for tab_id in &tab_ids {
+                if let Some(ix) = self.tabs.iter().position(|tab| tab.id == *tab_id) {
+                    self.tabs[ix].backend.send(BackendCommand::Close);
+                    self.tabs.retain(|t| t.id != *tab_id);
+                }
+            }
+            self.tab_groups.remove(group_ix.unwrap());
+            self.pane_root.remove_tab(&id);
+        } else {
+            // Just remove this tab from the group
+            if let Some(ix) = self.tabs.iter().position(|tab| tab.id == id) {
+                self.tabs[ix].backend.send(BackendCommand::Close);
+                self.tabs.retain(|t| t.id != id);
+            }
+            if let Some(g) = self.tab_groups.iter_mut().find(|g| g.pane_root.contains(&id)) {
+                g.pane_root.remove_tab(&id);
+            }
+            self.pane_root.remove_tab(&id);
+            self.sync_pane_root_to_group();
         }
+
+        if self.tabs.is_empty() || self.tab_groups.is_empty() {
+            self.pane_root = PaneLayout::Single(String::new());
+            self.focused_pane_path = vec![];
+            self.active_tab = None;
+            self.active_group = None;
+            self.system_tab_id = None;
+            self.cpu_history.clear();
+            self.net_rx_history.clear();
+            self.net_tx_history.clear();
+            self.system_status = None;
+            if let Some(handle) = self.dedicated_sftp_handle.take() {
+                handle.close();
+            }
+            self.dedicated_sftp_state = None;
+            cx.notify();
+            return;
+        }
+
+        // Reassign system_tab_id if the closed tab was monitored
+        if self.system_tab_id.as_deref() == Some(id.as_str()) {
+            self.system_tab_id = self.tabs.iter().find(|t| t.kind == TabKind::Ssh && t.connected).map(|t| t.id.clone());
+            if self.system_tab_id.is_none() {
+                self.system_status = Some("monitored session closed".to_string().into());
+            }
+        }
+        let was_active = self.active_tab.as_deref() == Some(id.as_str());
+        if was_active
+            || self
+                .active_tab
+                .as_ref()
+                .is_some_and(|active_id| !self.tabs.iter().any(|tab| &tab.id == active_id))
+        {
+            // Activate next available pane
+            let first_id = self.pane_root.tab_ids().first().copied().map(String::from)
+                .or_else(|| self.tabs.first().map(|t| t.id.clone()));
+            if let Some(new_id) = first_id {
+                self.active_tab = Some(new_id.clone());
+                self.focus_pane_with_id(new_id);
+            }
+        } else {
+            // Pane root structure may have changed (e.g. sibling removed), recalc path
+            if let Some(active_id) = self.active_tab.clone() {
+                self.focus_pane_with_id(active_id);
+            }
+        }
+        cx.notify();
     }
 
     pub(crate) fn focus_terminal(
@@ -492,6 +578,22 @@ impl Ashell {
         cx: &mut Context<Self>,
     ) {
         self.focus_handle.focus(window, cx);
+        // Check if click is in a different pane and focus it
+        let click_pos = event.position;
+        let current_active = self.active_tab.clone();
+        let clicked_tab_id = self.terminal_bounds.iter().find_map(|(id, bounds)| {
+            if bounds.contains(&click_pos) {
+                Some(id.clone())
+            } else {
+                None
+            }
+        });
+        if let Some(tab_id) = clicked_tab_id {
+            if current_active.as_deref() != Some(tab_id.as_str()) {
+                self.focus_pane_with_id(tab_id.clone());
+                cx.notify();
+            }
+        }
         if event.button == MouseButton::Left {
             self.begin_terminal_selection(event, cx);
         }
@@ -560,11 +662,379 @@ impl Ashell {
         let width = (viewport.width.as_f32() - sidebar_width - TERMINAL_PADDING_X - 8.0)
             .max(self.terminal_cell_width());
         let height = (terminal_height - TERMINAL_PADDING_Y).max(self.terminal_line_height());
-        let cols = (width / self.terminal_cell_width()).floor().max(1.0) as u16;
-        let rows = (height / self.terminal_line_height()).floor().max(1.0) as u16;
+        let total_cols = (width / self.terminal_cell_width()).floor().max(1.0) as u16;
+        let total_rows = (height / self.terminal_line_height()).floor().max(1.0) as u16;
 
-        for tab in &mut self.tabs {
-            tab.resize(cols, rows);
+        Self::resize_pane_tree(&mut self.tabs, &self.pane_root, total_cols, total_rows);
+    }
+
+    fn resize_pane_tree(
+        tabs: &mut [TerminalTab],
+        layout: &PaneLayout,
+        cols: u16,
+        rows: u16,
+    ) {
+        match layout {
+            PaneLayout::Single(id) => {
+                if let Some(tab) = tabs.iter_mut().find(|t| t.id == *id) {
+                    tab.resize(cols.max(1), rows.max(1));
+                }
+            }
+            PaneLayout::Horizontal(children, _) => {
+                let n = children.len() as u16;
+                let each_rows = (rows / n).max(1);
+                for child in children {
+                    Self::resize_pane_tree(tabs, child, cols, each_rows);
+                }
+            }
+            PaneLayout::Vertical(children, _) => {
+                let n = children.len() as u16;
+                let each_cols = (cols / n).max(1);
+                for child in children {
+                    Self::resize_pane_tree(tabs, child, each_cols, rows);
+                }
+            }
+        }
+    }
+
+    pub(crate) fn split_current_pane(&mut self, direction: &str, cx: &mut Context<Self>) {
+        eprintln!(
+            "[split] direction={} pane_root={:?} focused_path={:?} active_tab={:?} tabs={}",
+            direction,
+            self.pane_root,
+            self.focused_pane_path,
+            self.active_tab,
+            self.tabs.len(),
+        );
+        let current_id = match self.pane_root.focused_tab_id(&self.focused_pane_path) {
+            Some(id) if !id.is_empty() => id.to_string(),
+            _ => return,
+        };
+        // Find current tab to clone its type/session
+        let current_tab = match self.tabs.iter().find(|t| t.id == current_id) {
+            Some(tab) => tab,
+            None => return,
+        };
+        let new_id = Uuid::new_v4().to_string();
+        let mut tab = match current_tab.kind {
+            TabKind::Local => {
+                match local_terminal::spawn_local_terminal(
+                    new_id.clone(),
+                    DEFAULT_COLS,
+                    DEFAULT_ROWS,
+                    self.events_tx.clone(),
+                ) {
+                    Ok(backend) => TerminalTab::new_local(
+                        new_id.clone(),
+                        "Local".into(),
+                        backend,
+                        self.events_tx.clone(),
+                    ),
+                    Err(err) => {
+                        self.status = format!("failed to split: {err:#}").into();
+                        cx.notify();
+                        return;
+                    }
+                }
+            }
+            TabKind::Ssh => {
+                let Some(session) = current_tab.session.clone() else {
+                    self.status = "cannot split: no session info".into();
+                    cx.notify();
+                    return;
+                };
+                let backend = ssh_terminal::spawn_ssh_terminal(
+                    self.runtime.handle(),
+                    new_id.clone(),
+                    session.clone(),
+                    DEFAULT_COLS,
+                    DEFAULT_ROWS,
+                    self.events_tx.clone(),
+                );
+                TerminalTab::new_ssh(
+                    new_id.clone(),
+                    &session,
+                    backend,
+                    self.events_tx.clone(),
+                )
+            }
+        };
+        tab.resize(DEFAULT_COLS, DEFAULT_ROWS);
+        // Do NOT add to tab_groups — pane stays within the existing group
+        self.tabs.push(tab);
+        // Do NOT scroll tab bar or add tab bar entry
+
+        let current_pane = PaneLayout::Single(current_id);
+        let new_pane = PaneLayout::Single(new_id.clone());
+
+        let split_layout = match direction {
+            "left" | "right" => {
+                let children = match direction {
+                    "left" => vec![new_pane, current_pane],
+                    _ => vec![current_pane, new_pane],
+                };
+                PaneLayout::Vertical(children, 0.5)
+            }
+            "up" | "down" => {
+                let children = match direction {
+                    "up" => vec![new_pane, current_pane],
+                    _ => vec![current_pane, new_pane],
+                };
+                PaneLayout::Horizontal(children, 0.5)
+            }
+            _ => return,
+        };
+
+        self.pane_root.replace_at(&self.focused_pane_path, split_layout);
+        self.sync_pane_root_to_group();
+        // Update focused_pane_path: the new pane is at the indicated child index
+        let parent_path = self.focused_pane_path.clone();
+        let mut new_full_path = parent_path;
+        if direction == "right" || direction == "down" {
+            new_full_path.push(1);
+        } else {
+            new_full_path.push(0);
+        }
+        self.focused_pane_path = new_full_path;
+        self.active_tab = Some(new_id);
+        self.status = "pane split".into();
+        eprintln!(
+            "[split] DONE: pane_root={:?} focused_path={:?} active_tab={:?} tabs={}",
+            self.pane_root,
+            self.focused_pane_path,
+            self.active_tab,
+            self.tabs.len(),
+        );
+        cx.notify();
+    }
+
+    pub(crate) fn focus_adjacent_pane(&mut self, direction: &str) {
+        if self.focused_pane_path.is_empty() {
+            return;
+        }
+        let path = self.focused_pane_path.clone();
+        if let Some(new_path) = Self::find_adjacent_pane(&self.pane_root, &path, direction) {
+            self.focused_pane_path = new_path;
+            if let Some(id) = self.pane_root.focused_tab_id(&self.focused_pane_path) {
+                self.active_tab = Some(id.to_string());
+            }
+        }
+    }
+
+    fn first_leaf_path(layout: &PaneLayout) -> Vec<usize> {
+        match layout {
+            PaneLayout::Single(_) => vec![],
+            PaneLayout::Horizontal(children, _) | PaneLayout::Vertical(children, _) => {
+                let mut path = vec![0];
+                path.extend(Self::first_leaf_path(&children[0]));
+                path
+            }
+        }
+    }
+
+    fn leaf_at_index(layout: &PaneLayout, index: usize) -> Vec<usize> {
+        match layout {
+            PaneLayout::Single(_) => vec![],
+            PaneLayout::Horizontal(children, _) | PaneLayout::Vertical(children, _) => {
+                if children.is_empty() {
+                    return vec![];
+                }
+                let i = index.min(children.len() - 1);
+                let mut path = vec![i];
+                path.extend(Self::first_leaf_path(&children[i]));
+                path
+            }
+        }
+    }
+
+    fn find_adjacent_pane(layout: &PaneLayout, path: &[usize], direction: &str) -> Option<Vec<usize>> {
+        if path.is_empty() {
+            return None;
+        }
+        match layout {
+            PaneLayout::Single(_) => None,
+            PaneLayout::Horizontal(children, _) | PaneLayout::Vertical(children, _) => {
+                let is_horizontal = matches!(layout, PaneLayout::Horizontal(_, _));
+                let idx = path[0];
+
+                // Does this split level match the movement direction?
+                let vert = direction == "up" || direction == "down";
+                let horiz = direction == "left" || direction == "right";
+                // PaneLayout::Horizontal renders as v_flex (vertical stack),
+                // PaneLayout::Vertical renders as h_flex (horizontal row).
+                // So for a Vertical (h_flex), h/l moves between children;
+                // for a Horizontal (v_flex), j/k moves between children.
+                let moves_in_this_split = (vert && is_horizontal) || (horiz && !is_horizontal);
+
+                if path.len() == 1 {
+                    // Direct child level
+                    if moves_in_this_split {
+                        let delta: i32 = if direction == "up" || direction == "left" { -1 } else { 1 };
+                        let new_idx = idx as i32 + delta;
+                        if new_idx >= 0 && (new_idx as usize) < children.len() {
+                            let mut path = vec![new_idx as usize];
+                            path.extend(Self::first_leaf_path(&children[new_idx as usize]));
+                            Some(path)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    // Recurse into child first
+                    if let Some(mut child_path) = Self::find_adjacent_pane(&children[idx], &path[1..], direction) {
+                        child_path.insert(0, idx);
+                        Some(child_path)
+                    } else if moves_in_this_split {
+                        // Try sibling at this level
+                        let delta: i32 = if direction == "up" || direction == "left" { -1 } else { 1 };
+                        let new_idx = idx as i32 + delta;
+                        if new_idx >= 0 && (new_idx as usize) < children.len() {
+                            let inner_idx = *path.get(1).unwrap_or(&0);
+                            let mut path = vec![new_idx as usize];
+                            path.extend(Self::leaf_at_index(&children[new_idx as usize], inner_idx));
+                            Some(path)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                }
+            }
+        }
+    }
+
+    pub(crate) fn activate_group(
+        &mut self,
+        group_id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Save current group state
+        if let Some(current_group_id) = self.active_group.clone() {
+            if let Some(group) = self.tab_groups.iter_mut().find(|g| g.id == current_group_id) {
+                group.pane_root = self.pane_root.clone();
+            }
+        }
+        // Load new group state
+        if let Some(group) = self.tab_groups.iter().find(|g| g.id == group_id) {
+            self.pane_root = group.pane_root.clone();
+            self.active_group = Some(group_id);
+            let ids = group.pane_root.tab_ids();
+            if let Some(&first_id) = ids.first() {
+                self.active_tab = Some(first_id.to_string());
+                self.focus_pane_with_id(first_id.to_string());
+            }
+            self.focus_handle.focus(window, cx);
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn sync_pane_root_to_group(&mut self) {
+        if let Some(group_id) = self.active_group.clone() {
+            if let Some(group) = self.tab_groups.iter_mut().find(|g| g.id == group_id) {
+                group.pane_root = self.pane_root.clone();
+            }
+        }
+    }
+
+    pub(crate) fn start_drag_split(
+        &mut self,
+        parent_path: Vec<usize>,
+        child_index: usize,
+        event: &MouseDownEvent,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+        self.dragging_splitter = Some((parent_path, child_index));
+        self.drag_split_origin = Some(event.position);
+    }
+
+    pub(crate) fn on_split_drag_move(
+        &mut self,
+        event: &MouseMoveEvent,
+        window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+        let Some((ref parent_path, child_idx)) = self.dragging_splitter.clone() else {
+            return;
+        };
+        let Some(origin) = self.drag_split_origin else {
+            return;
+        };
+        let total = window.viewport_size();
+        let is_horizontal = Self::is_layout_horizontal_at(&self.pane_root, parent_path);
+        let delta: f32 = if is_horizontal {
+            (event.position.y - origin.y).into()
+        } else {
+            (event.position.x - origin.x).into()
+        };
+        let total_size: f32 = if is_horizontal {
+            total.height.into()
+        } else {
+            total.width.into()
+        };
+        if delta.abs() < 5.0 {
+            return; // dead zone
+        }
+        let ratio_delta = delta / total_size;
+        Self::adjust_split_ratio(&mut self.pane_root, parent_path, child_idx, ratio_delta);
+        self.drag_split_origin = Some(event.position);
+        self.sync_pane_root_to_group();
+    }
+
+    pub(crate) fn end_drag_split(&mut self) {
+        self.dragging_splitter = None;
+        self.drag_split_origin = None;
+    }
+
+    fn is_layout_horizontal_at(layout: &PaneLayout, path: &[usize]) -> bool {
+        match (layout, path) {
+            (PaneLayout::Horizontal(_, _), []) => true,
+            (PaneLayout::Vertical(_, _), []) => false,
+            (PaneLayout::Horizontal(children, _) | PaneLayout::Vertical(children, _), [first, rest @ ..]) => {
+                children.get(*first).map_or(false, |c| Self::is_layout_horizontal_at(c, rest))
+            }
+            _ => false,
+        }
+    }
+
+    fn adjust_split_ratio(layout: &mut PaneLayout, path: &[usize], _child_idx: usize, delta: f32) {
+        if let PaneLayout::Horizontal(children, ratio) | PaneLayout::Vertical(children, ratio) = layout {
+            if path.is_empty() {
+                *ratio = (*ratio + delta).clamp(0.1, 0.9);
+            } else {
+                let (&first, rest) = path.split_first().unwrap();
+                if let Some(child) = children.get_mut(first) {
+                    Self::adjust_split_ratio(child, rest, _child_idx, delta);
+                }
+            }
+        }
+    }
+
+    pub(crate) fn focus_pane_with_id(&mut self, tab_id: String) {
+        // Find the path to the given tab_id in the pane tree
+        fn find_path(layout: &PaneLayout, target: &str, path: &mut Vec<usize>) -> bool {
+            match layout {
+                PaneLayout::Single(id) => id == target,
+                PaneLayout::Horizontal(children, _) | PaneLayout::Vertical(children, _) => {
+                    for (i, child) in children.iter().enumerate() {
+                        path.push(i);
+                        if find_path(child, target, path) {
+                            return true;
+                        }
+                        path.pop();
+                    }
+                    false
+                }
+            }
+        }
+        let mut path = Vec::new();
+        if find_path(&self.pane_root, &tab_id, &mut path) {
+            self.focused_pane_path = path;
+            self.active_tab = Some(tab_id);
         }
     }
 }
