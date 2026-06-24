@@ -558,6 +558,9 @@ impl Ashell {
         };
         self.connection_progress = None;
         let mut groups_to_restart_sftp = std::collections::HashSet::new();
+        if self.tab_groups.iter().any(|g| g.id == progress.tab_id) {
+            groups_to_restart_sftp.insert(progress.tab_id.clone());
+        }
 
         let mut retry_tabs = Vec::new();
         for (ix, tab) in self.tabs.iter().enumerate() {
@@ -566,7 +569,7 @@ impl Ashell {
             }
         }
 
-        if retry_tabs.is_empty() {
+        if retry_tabs.is_empty() && groups_to_restart_sftp.is_empty() {
             cx.notify();
             return;
         }
@@ -639,10 +642,20 @@ impl Ashell {
     }
 
     pub(crate) fn cancel_connection_progress(&mut self, cx: &mut Context<Self>) {
-        if self.connection_progress.is_none() {
+        let Some(progress) = self.connection_progress.clone() else {
+            return;
+        };
+        self.connection_progress = None;
+
+        if self.tab_groups.iter().any(|g| g.id == progress.tab_id) {
+            if let Some(group) = self.tab_groups.iter_mut().find(|g| g.id == progress.tab_id) {
+                group.sftp = None;
+            }
+            self.sftp_handles.remove(&progress.tab_id);
+            cx.notify();
             return;
         }
-        self.connection_progress = None;
+
         let tabs_to_close: Vec<_> = self
             .tabs
             .iter()

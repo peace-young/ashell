@@ -218,8 +218,12 @@ pub fn spawn_sftp(
         .await
         {
             let _ = events.send(BackendEvent::SftpStatus {
-                tab_id,
+                tab_id: tab_id.clone(),
                 text: format!("sftp error: {err:#}"),
+            });
+            let _ = events.send(BackendEvent::Closed {
+                tab_id,
+                reason: format!("sftp error: {err:#}"),
             });
         }
     });
@@ -824,6 +828,8 @@ async fn connect_and_authenticate(
 ) -> Result<Arc<russh::client::Handle<SftpClientHandler>>> {
     let config = Arc::new(client::Config {
         inactivity_timeout: Some(std::time::Duration::from_secs(600)),
+        keepalive_interval: Some(std::time::Duration::from_secs(10)),
+        keepalive_max: 3,
         ..Default::default()
     });
     let addr = format!("{}:{}", session.host, session.port);
