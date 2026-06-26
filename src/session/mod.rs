@@ -494,6 +494,12 @@ impl Ashell {
             self.events_tx.clone(),
         ));
         self.active_tab = Some(id.clone());
+        self.connection_progress = Some(crate::app::ConnectionProgress {
+            tab_id: id.clone(),
+            title: rust_i18n::t!("connecting").into(),
+            lines: vec![rust_i18n::t!("starting_connection").into()],
+            failed: false,
+        });
         self.pane_root = PaneLayout::Single(id.clone());
         self.focused_pane_path = vec![];
         let group_id = Uuid::new_v4().to_string();
