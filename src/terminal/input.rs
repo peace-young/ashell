@@ -495,8 +495,8 @@ impl Ashell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // Platform modifier (Cmd on macOS, Ctrl on Windows/Linux) + scroll → zoom terminal font size
-        if event.modifiers.platform {
+        // Ctrl + scroll → zoom terminal font size
+        if event.modifiers.control {
             let delta = match event.delta {
                 ScrollDelta::Lines(point) => point.y as f32 * 20.0,
                 ScrollDelta::Pixels(point) => point.y.as_f32(),
