@@ -2270,8 +2270,11 @@ impl Ashell {
                 div()
                     .size_full()
                     .on_prepaint(move |bounds, _window, cx| {
-                        let _ = view.update(cx, |this, _| {
-                            this.terminal_panel_bounds = Some(bounds);
+                        let _ = view.update(cx, |this, cx| {
+                            if this.terminal_panel_bounds != Some(bounds) {
+                                this.terminal_panel_bounds = Some(bounds);
+                                cx.notify();
+                            }
                         });
                     })
                     .overflow_hidden()
@@ -2320,8 +2323,6 @@ impl Ashell {
                 let Some(snapshot) = snapshot else {
                     return div().into_any_element();
                 };
-                let view = cx.entity();
-                let tab_id_clone = tab_id.clone();
                 let tab_id_clone2 = tab_id.clone();
                 let focus_handle = this.focus_handle.clone();
                 let marked_text = if is_focused {
@@ -2336,11 +2337,6 @@ impl Ashell {
                 let mut el = div()
                     .size_full()
                     .overflow_hidden()
-                    .on_prepaint(move |bounds, _window, cx| {
-                        let _ = view.update(cx, |this, _| {
-                            this.terminal_bounds.insert(tab_id_clone.clone(), bounds);
-                        });
-                    })
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, _, _, cx| {
@@ -2357,6 +2353,7 @@ impl Ashell {
                         font_size,
                         line_height,
                         cell_width,
+                        tab_id.to_string(),
                         this.search_highlight_map(
                             tab_id,
                             cx.theme().danger.opacity(0.35),
@@ -2433,10 +2430,10 @@ impl Ashell {
                     el = el.opacity(0.85);
                 }
 
+                let mut wrapper = div().size_full();
                 if has_multiple_panes {
                     if is_focused {
-                        el = div()
-                            .size_full()
+                        wrapper = wrapper
                             .relative()
                             .child(
                                 div()
@@ -2477,11 +2474,13 @@ impl Ashell {
                             .p(px(4.))
                             .child(el);
                     } else {
-                        el = div().size_full().p(px(4.)).child(el);
+                        wrapper = wrapper.p(px(4.)).child(el);
                     }
+                } else {
+                    wrapper = wrapper.child(el);
                 }
 
-                el.into_any_element()
+                wrapper.into_any_element()
             }
             PaneLayout::Horizontal(children, ratio) => {
                 v_flex()
@@ -2596,7 +2595,7 @@ impl Render for Ashell {
             self.active_tab = self.tabs.first().map(|tab| tab.id.clone());
         }
         self.sync_sftp_path_input(window, cx);
-        self.sync_terminal_size(window, cx);
+
         if self.show_transfers_dialog {
             self.show_transfers_dialog = false;
             self.show_transfers_dialog(window, cx);

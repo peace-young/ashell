@@ -1,7 +1,7 @@
 pub mod config;
 
 use gpui::{
-    App, AppContext as _, Context, Entity, KeyDownEvent, MouseButton, MouseDownEvent,
+    AppContext as _, Context, Entity, KeyDownEvent, MouseButton, MouseDownEvent,
     MouseMoveEvent, SharedString, Window, px,
 };
 use gpui_component::{Theme, WindowExt as _, input::InputState};
@@ -13,8 +13,7 @@ use self::config::{AuthMethod, Session};
 use crate::{
     Ashell, PaneLayout, SelectorEntry, TabGroup,
     app::constants::{
-        DEFAULT_COLS, DEFAULT_ROWS, SIDEBAR_WIDTH, TAB_BAR_HEIGHT, TERMINAL_PADDING_X,
-        TERMINAL_PADDING_Y,
+        DEFAULT_COLS, DEFAULT_ROWS,
     },
     backend::{local, ssh},
     terminal::{BackendCommand, RenderSnapshot, TabKind, TerminalTab},
@@ -959,64 +958,9 @@ impl Ashell {
         format!("{}@{}:{}", session.user, session.host, session.port)
     }
 
-    pub(crate) fn sync_terminal_size(&mut self, window: &Window, cx: &App) {
-        let viewport = window.viewport_size();
-        let sidebar_width = self
-            .workspace_panels
-            .read(cx)
-            .sizes()
-            .first()
-            .map(|size| size.as_f32())
-            .unwrap_or(SIDEBAR_WIDTH);
 
-        // Use the whole terminal panel bounds for PTY sizing.
-        // Individual pane bounds are smaller when split, so using them here
-        // would shrink the root PTY dimensions a second time.
-        let (width, height) = if let Some(bounds) = self.terminal_panel_bounds {
-            (bounds.size.width.as_f32(), bounds.size.height.as_f32())
-        } else {
-            let terminal_height = self
-                .body_panels
-                .read(cx)
-                .sizes()
-                .first()
-                .map(|size| size.as_f32())
-                .unwrap_or(viewport.height.as_f32() - TAB_BAR_HEIGHT - 248.0);
-            (
-                (viewport.width.as_f32() - sidebar_width - TERMINAL_PADDING_X - 8.0)
-                    .max(self.terminal_cell_width()),
-                (terminal_height - TERMINAL_PADDING_Y).max(self.terminal_line_height()),
-            )
-        };
-        let total_cols = (width / self.terminal_cell_width()).floor().max(1.0) as u16;
-        let total_rows = (height / self.terminal_line_height()).floor().max(1.0) as u16;
 
-        Self::resize_pane_tree(&mut self.tabs, &self.pane_root, total_cols, total_rows);
-    }
 
-    fn resize_pane_tree(tabs: &mut [TerminalTab], layout: &PaneLayout, cols: u16, rows: u16) {
-        match layout {
-            PaneLayout::Single(id) => {
-                if let Some(tab) = tabs.iter_mut().find(|t| t.id == *id) {
-                    tab.resize(cols.max(1), rows.max(1));
-                }
-            }
-            PaneLayout::Horizontal(children, _) => {
-                let n = children.len() as u16;
-                let each_rows = (rows / n).max(1);
-                for child in children {
-                    Self::resize_pane_tree(tabs, child, cols, each_rows);
-                }
-            }
-            PaneLayout::Vertical(children, _) => {
-                let n = children.len() as u16;
-                let each_cols = (cols / n).max(1);
-                for child in children {
-                    Self::resize_pane_tree(tabs, child, each_cols, rows);
-                }
-            }
-        }
-    }
 
     pub(crate) fn split_current_pane(&mut self, direction: &str, cx: &mut Context<Self>) {
         tracing::info!(

@@ -132,6 +132,7 @@ pub struct TerminalElement {
     font_size: Pixels,
     line_height: Pixels,
     cell_width: Pixels,
+    tab_id: String,
     search_highlights: Option<std::collections::HashMap<(i32, i32), Hsla>>,
 }
 
@@ -271,6 +272,7 @@ impl TerminalElement {
         font_size: Pixels,
         line_height: Pixels,
         cell_width: Pixels,
+        tab_id: String,
         search_highlights: Option<std::collections::HashMap<(i32, i32), Hsla>>,
     ) -> Self {
         Self {
@@ -282,6 +284,7 @@ impl TerminalElement {
             font_size,
             line_height,
             cell_width,
+            tab_id,
             search_highlights,
         }
     }
@@ -541,6 +544,32 @@ impl Element for TerminalElement {
     ) -> Self::PrepaintState {
         let _ = self.base_text_style(cx);
         let (rects, runs, custom_blocks) = self.layout_grid(cx);
+
+        // Save the precise GPUI-rendered bounds of this terminal element.
+        // This is 100% accurate because it is recorded during layout prepaint.
+        let view = self.view.clone();
+        let tab_id = self.tab_id.clone();
+        let _ = view.update(cx, |this, cx| {
+            let old_bounds = this.terminal_bounds.insert(tab_id.clone(), bounds);
+            
+            // Sync PTY size unconditionally on every prepaint layout pass to ensure
+            // absolute synchronization with GPUI layout regardless of intermediate events.
+            let line_height = this.terminal_line_height();
+            let cell_width = this.terminal_cell_width();
+            let w = bounds.size.width.as_f32();
+            let h = bounds.size.height.as_f32();
+            let cols = (w / cell_width).floor().max(1.0) as u16;
+            let rows = (h / line_height).floor().max(1.0) as u16;
+            
+            if let Some(tab) = this.tabs.iter_mut().find(|t| t.id == tab_id) {
+                tab.resize(cols, rows);
+            }
+            
+            if old_bounds != Some(bounds) {
+                cx.notify();
+            }
+        });
+
         PrepaintState {
             bounds,
             metrics: TerminalMetrics {
@@ -564,18 +593,24 @@ impl Element for TerminalElement {
         window: &mut Window,
         cx: &mut App,
     ) {
+        // Compute a vertical offset to center the text grid vertically,
+        // distributing the leftover pixel remainder evenly to the top and bottom.
+        let grid_height = prepaint.metrics.line_height * (prepaint.bounds.size.height.as_f32() / prepaint.metrics.line_height.as_f32()).floor();
+        let y_offset = ((prepaint.bounds.size.height - grid_height) / 2.0).max(px(0.0));
+        let draw_origin = point(prepaint.bounds.origin.x, prepaint.bounds.origin.y + y_offset);
+
         for rect in &prepaint.rects {
-            rect.paint(prepaint.bounds.origin, prepaint.metrics, window);
+            rect.paint(draw_origin, prepaint.metrics, window);
         }
 
         for run in &prepaint.runs {
-            run.paint(prepaint.bounds.origin, prepaint.metrics, window, cx);
+            run.paint(draw_origin, prepaint.metrics, window, cx);
         }
 
         for block in &prepaint.custom_blocks {
-            let x = prepaint.bounds.origin.x.as_f32()
+            let x = draw_origin.x.as_f32()
                 + block.col as f32 * prepaint.metrics.cell_width.as_f32();
-            let y = prepaint.bounds.origin.y.as_f32()
+            let y = draw_origin.y.as_f32()
                 + block.row as f32 * prepaint.metrics.line_height.as_f32();
             paint_custom_block(
                 window,
@@ -592,7 +627,7 @@ impl Element for TerminalElement {
             &self.focus_handle,
             TerminalInputHandler {
                 view: self.view.clone(),
-                element_bounds: prepaint.bounds,
+                element_bounds: Bounds::new(draw_origin, prepaint.bounds.size),
                 cell_width: prepaint.metrics.cell_width.as_f32(),
                 line_height: prepaint.metrics.line_height.as_f32(),
             },
@@ -602,8 +637,8 @@ impl Element for TerminalElement {
         if let Some(marked_text) = self.marked_text.as_ref().filter(|text| !text.is_empty()) {
             if let Some(cursor) = prepaint.cursor {
                 let pos = point(
-                    prepaint.bounds.origin.x + prepaint.metrics.cell_width * cursor.col as f32,
-                    prepaint.bounds.origin.y + prepaint.metrics.line_height * cursor.row as f32,
+                    draw_origin.x + prepaint.metrics.cell_width * cursor.col as f32,
+                    draw_origin.y + prepaint.metrics.line_height * cursor.row as f32,
                 );
                 let mut base_style = self.base_text_style(cx);
                 base_style.underline = Some(UnderlineStyle {
@@ -650,8 +685,8 @@ impl Element for TerminalElement {
             {
                 return;
             }
-            let x = prepaint.bounds.origin.x + prepaint.metrics.cell_width * cursor.col as f32;
-            let y = prepaint.bounds.origin.y + prepaint.metrics.line_height * cursor.row as f32;
+            let x = draw_origin.x + prepaint.metrics.cell_width * cursor.col as f32;
+            let y = draw_origin.y + prepaint.metrics.line_height * cursor.row as f32;
             match cursor.shape {
                 CursorShape::Hidden => {}
                 CursorShape::Beam => {
